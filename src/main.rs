@@ -8,6 +8,19 @@ const CHUNK_VOLUME: usize = CHUNK_USIZE * CHUNK_USIZE * CHUNK_USIZE;
 
 const BLOCK_AIR: u8 = 0;
 const BLOCK_GRASS: u8 = 1;
+const BLOCK_DIRT: u8 = 2;
+const BLOCK_STONE: u8 = 3;
+const BLOCK_WOOD: u8 = 4;
+const BLOCK_COUNT: u8 = 5;
+
+/// Per-block base colors (R, G, B). Face tinting is applied on top.
+const BLOCK_COLORS: [[u8; 3]; BLOCK_COUNT as usize] = [
+    [0, 0, 0],         // air (unused)
+    [100, 200, 30],    // grass — green
+    [140, 100, 60],    // dirt — brown
+    [130, 130, 130],   // stone — grey
+    [160, 120, 60],    // wood — tan
+];
 
 const WORLD_CHUNKS: i32 = 4; // 4x4x4 chunks = 64x64x64 blocks
 const WORLD_BLOCKS: i32 = WORLD_CHUNKS * CHUNK_SIZE;
@@ -55,14 +68,26 @@ const NEIGHBOR_OFFSETS: [[i32; 3]; 6] = [
     [0, 0, -1],
 ];
 
-const FACE_COLORS: [[u8; 4]; 6] = [
-    [100, 200, 30, 255], // top — brightest
-    [50, 100, 15, 255],  // bottom — darkest
-    [75, 150, 22, 255],  // right
-    [75, 150, 22, 255],  // left
-    [60, 120, 18, 255],  // front
-    [60, 120, 18, 255],  // back
+/// Face brightness multipliers (0.0–1.0) for fake directional lighting.
+const FACE_BRIGHTNESS: [f32; 6] = [
+    1.0,  // top — full brightness
+    0.5,  // bottom — darkest
+    0.75, // right
+    0.75, // left
+    0.6,  // front
+    0.6,  // back
 ];
+
+fn block_face_color(block_id: u8, face: usize) -> [u8; 4] {
+    let base = BLOCK_COLORS[block_id as usize];
+    let b = FACE_BRIGHTNESS[face];
+    [
+        (base[0] as f32 * b) as u8,
+        (base[1] as f32 * b) as u8,
+        (base[2] as f32 * b) as u8,
+        255,
+    ]
+}
 
 // ---------------------------------------------------------------------------
 // Terrain generation
@@ -101,9 +126,17 @@ impl Chunk {
 
                 for ly in 0..CHUNK_USIZE {
                     let wy = origin.y + ly as i32;
-                    if wy <= height {
-                        blocks[Self::index(lx, ly, lz)] = BLOCK_GRASS;
+                    if wy > height {
+                        continue;
                     }
+                    let depth = height - wy;
+                    blocks[Self::index(lx, ly, lz)] = if depth == 0 {
+                        BLOCK_GRASS // top layer
+                    } else if depth <= 3 {
+                        BLOCK_DIRT // 3 layers of dirt
+                    } else {
+                        BLOCK_STONE // everything below
+                    };
                 }
             }
         }
@@ -232,7 +265,8 @@ impl ChunkMesh {
         for y in 0..CHUNK_USIZE {
             for z in 0..CHUNK_USIZE {
                 for x in 0..CHUNK_USIZE {
-                    if chunk.get_block(x, y, z) == BLOCK_AIR {
+                    let block_id = chunk.get_block(x, y, z);
+                    if block_id == BLOCK_AIR {
                         continue;
                     }
 
@@ -252,10 +286,10 @@ impl ChunkMesh {
                         }
 
                         let norm = &FACE_NORMALS[face];
-                        let col = &FACE_COLORS[face];
                         let bx = wx as f32;
                         let by = wy as f32;
                         let bz = wz as f32;
+                        let col = block_face_color(block_id, face);
 
                         for v in &FACE_VERTS[face] {
                             positions.push(bx + v[0]);
@@ -604,9 +638,25 @@ fn main() {
 
     let mut dirty: Vec<bool> = vec![false; num_chunks];
 
+    // Block types the player can place (cycle with 1-4 keys)
+    const PLACEABLE: [u8; 4] = [BLOCK_GRASS, BLOCK_DIRT, BLOCK_STONE, BLOCK_WOOD];
+    const PLACE_NAMES: [&str; 4] = ["Grass", "Dirt", "Stone", "Wood"];
+    let mut selected: usize = 0;
+
     while !rl.window_should_close() {
         let dt = rl.get_frame_time();
         player.update(&rl, &world, dt);
+
+        // Block selection (keys 1-4)
+        if rl.is_key_pressed(KeyboardKey::KEY_ONE)   { selected = 0; }
+        if rl.is_key_pressed(KeyboardKey::KEY_TWO)   { selected = 1; }
+        if rl.is_key_pressed(KeyboardKey::KEY_THREE) { selected = 2; }
+        if rl.is_key_pressed(KeyboardKey::KEY_FOUR)  { selected = 3; }
+
+        // Scroll wheel to cycle
+        let scroll = rl.get_mouse_wheel_move();
+        if scroll > 0.0 { selected = (selected + 1) % PLACEABLE.len(); }
+        if scroll < 0.0 { selected = (selected + PLACEABLE.len() - 1) % PLACEABLE.len(); }
 
         // Raycast
         let eye = player.eye_position();
@@ -643,7 +693,7 @@ fn main() {
 
                     if !overlaps {
                         let affected = world.dirty_chunks_for_block(a.x, a.y, a.z);
-                        world.set_block(a.x, a.y, a.z, BLOCK_GRASS);
+                        world.set_block(a.x, a.y, a.z, PLACEABLE[selected]);
                         for idx in affected { dirty[idx] = true; }
                     }
                 }
@@ -684,6 +734,8 @@ fn main() {
         d.draw_line(cx, cy - 10, cx, cy + 10, Color::WHITE);
 
         d.draw_fps(10, 10);
-        d.draw_text("LMB: break | RMB: place | WASD + Mouse | SPACE: jump", 10, 30, 18, Color::WHITE);
+        let block_name = PLACE_NAMES[selected];
+        let hud = format!("[{}] {} | LMB: break | RMB: place | 1-4/Scroll: select | WASD SPACE", selected + 1, block_name);
+        d.draw_text(&hud, 10, 30, 18, Color::WHITE);
     }
 }
