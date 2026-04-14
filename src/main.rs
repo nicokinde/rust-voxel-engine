@@ -11,15 +11,24 @@ const BLOCK_GRASS: u8 = 1;
 const BLOCK_DIRT: u8 = 2;
 const BLOCK_STONE: u8 = 3;
 const BLOCK_WOOD: u8 = 4;
-const BLOCK_COUNT: u8 = 5;
+const BLOCK_LEAVES: u8 = 5;
+const BLOCK_COUNT: u8 = 6;
 
-/// Per-block base colors (R, G, B). Face tinting is applied on top.
-const BLOCK_COLORS: [[u8; 3]; BLOCK_COUNT as usize] = [
-    [0, 0, 0],         // air (unused)
-    [100, 200, 30],    // grass — green
-    [140, 100, 60],    // dirt — brown
-    [130, 130, 130],   // stone — grey
-    [160, 120, 60],    // wood — tan
+/// Per-block per-face base colors (R, G, B).
+/// Order: top(+Y), bottom(-Y), right(+X), left(-X), front(+Z), back(-Z)
+const BLOCK_FACE_BASES: [[[u8; 3]; 6]; BLOCK_COUNT as usize] = [
+    // Air (unused)
+    [[0,0,0],[0,0,0],[0,0,0],[0,0,0],[0,0,0],[0,0,0]],
+    // Grass: green top, dirt bottom, green-brown sides
+    [[86,168,40],[134,96,67],[96,130,56],[96,130,56],[96,130,56],[96,130,56]],
+    // Dirt: brown all faces, slight variation
+    [[134,96,67],[134,96,67],[134,96,67],[134,96,67],[134,96,67],[134,96,67]],
+    // Stone: grey with slight blue tint
+    [[136,136,136],[120,120,120],[128,128,128],[128,128,128],[128,128,128],[128,128,128]],
+    // Wood: brown bark sides, lighter ring top/bottom
+    [[187,157,100],[187,157,100],[110,78,42],[110,78,42],[110,78,42],[110,78,42]],
+    // Leaves: dark green, slightly brighter top
+    [[58,120,30],[40,85,20],[48,100,25],[48,100,25],[48,100,25],[48,100,25]],
 ];
 
 const WORLD_CHUNKS: i32 = 4; // 4x4x4 chunks = 64x64x64 blocks
@@ -78,30 +87,92 @@ const FACE_BRIGHTNESS: [f32; 6] = [
     0.6,  // back
 ];
 
-fn block_face_color(block_id: u8, face: usize) -> [u8; 4] {
-    let base = BLOCK_COLORS[block_id as usize];
+/// Simple hash for per-vertex color noise (fake texture).
+fn hash_noise(x: i32, y: i32, z: i32, face: i32) -> f32 {
+    let n = x.wrapping_mul(374761393)
+        ^ y.wrapping_mul(668265263)
+        ^ z.wrapping_mul(1274126177)
+        ^ face.wrapping_mul(1911520717);
+    let n = ((n >> 13) ^ n).wrapping_mul(n.wrapping_mul(n).wrapping_mul(60493).wrapping_add(19990303));
+    let n = (n >> 13) ^ n;
+    // Map to 0.85..1.0 range — subtle variation
+    0.85 + (n as u32 as f32 / u32::MAX as f32) * 0.15
+}
+
+fn block_face_color_noisy(block_id: u8, face: usize, wx: i32, wy: i32, wz: i32) -> [u8; 4] {
+    let base = BLOCK_FACE_BASES[block_id as usize][face];
     let b = FACE_BRIGHTNESS[face];
+    let noise = hash_noise(wx, wy, wz, face as i32);
     [
-        (base[0] as f32 * b) as u8,
-        (base[1] as f32 * b) as u8,
-        (base[2] as f32 * b) as u8,
+        ((base[0] as f32 * b * noise).min(255.0)) as u8,
+        ((base[1] as f32 * b * noise).min(255.0)) as u8,
+        ((base[2] as f32 * b * noise).min(255.0)) as u8,
         255,
     ]
 }
 
 // ---------------------------------------------------------------------------
-// Terrain generation
+// Terrain generation — value noise with octaves
 // ---------------------------------------------------------------------------
+
+/// Integer hash → float in [0, 1).
+fn hash2d(x: i32, z: i32) -> f32 {
+    let n = x.wrapping_mul(374761393).wrapping_add(z.wrapping_mul(668265263));
+    let n = ((n >> 13) ^ n).wrapping_mul(n.wrapping_mul(n).wrapping_mul(60493).wrapping_add(19990303));
+    (((n >> 13) ^ n) as u32) as f32 / u32::MAX as f32
+}
+
+/// Smooth noise with bilinear interpolation.
+fn smooth_noise(x: f32, z: f32) -> f32 {
+    let ix = x.floor() as i32;
+    let iz = z.floor() as i32;
+    let fx = x - ix as f32;
+    let fz = z - iz as f32;
+    // Smoothstep
+    let fx = fx * fx * (3.0 - 2.0 * fx);
+    let fz = fz * fz * (3.0 - 2.0 * fz);
+
+    let v00 = hash2d(ix, iz);
+    let v10 = hash2d(ix + 1, iz);
+    let v01 = hash2d(ix, iz + 1);
+    let v11 = hash2d(ix + 1, iz + 1);
+
+    let a = v00 + (v10 - v00) * fx;
+    let b = v01 + (v11 - v01) * fx;
+    a + (b - a) * fz
+}
+
+/// Fractal noise: 4 octaves for natural-looking terrain.
+fn fbm(x: f32, z: f32) -> f32 {
+    let mut value = 0.0;
+    let mut amplitude = 1.0;
+    let mut frequency = 1.0;
+    let mut max_amp = 0.0;
+    for _ in 0..4 {
+        value += smooth_noise(x * frequency, z * frequency) * amplitude;
+        max_amp += amplitude;
+        amplitude *= 0.5;
+        frequency *= 2.0;
+    }
+    value / max_amp // normalized to [0, 1]
+}
+
+const SEA_LEVEL: i32 = 14;
 
 fn terrain_height(wx: i32, wz: i32) -> i32 {
     let x = wx as f32;
     let z = wz as f32;
-    let h = 16.0
-        + (x * 0.05).sin() * 4.0
-        + (z * 0.07).sin() * 4.0
-        + (x * 0.1 + z * 0.1).sin() * 2.0
-        + (x * 0.02 + z * 0.03).cos() * 6.0;
-    (h as i32).clamp(1, WORLD_BLOCKS - 1)
+    // Large-scale hills + detail
+    let h = fbm(x * 0.02 + 0.3, z * 0.02 + 0.7) * 24.0 + 8.0;
+    (h as i32).clamp(1, WORLD_BLOCKS - 2)
+}
+
+/// Determine if a tree should spawn at (wx, wz). Simple hash-based placement.
+fn has_tree(wx: i32, wz: i32) -> bool {
+    // Only try every 4th column in a grid, then hash to thin out
+    if wx % 5 != 0 || wz % 5 != 0 { return false; }
+    let h = hash2d(wx.wrapping_mul(13), wz.wrapping_mul(7));
+    h < 0.3 // ~30% chance on valid grid points
 }
 
 // ---------------------------------------------------------------------------
@@ -131,17 +202,26 @@ impl Chunk {
                     }
                     let depth = height - wy;
                     blocks[Self::index(lx, ly, lz)] = if depth == 0 {
-                        BLOCK_GRASS // top layer
+                        BLOCK_GRASS
                     } else if depth <= 3 {
-                        BLOCK_DIRT // 3 layers of dirt
+                        BLOCK_DIRT
                     } else {
-                        BLOCK_STONE // everything below
+                        BLOCK_STONE
                     };
                 }
             }
         }
 
         Chunk { blocks, position }
+    }
+
+    fn set_block_if_air(&mut self, x: usize, y: usize, z: usize, block: u8) {
+        if x < CHUNK_USIZE && y < CHUNK_USIZE && z < CHUNK_USIZE {
+            let idx = Self::index(x, y, z);
+            if self.blocks[idx] == BLOCK_AIR {
+                self.blocks[idx] = block;
+            }
+        }
     }
 
     fn index(x: usize, y: usize, z: usize) -> usize {
@@ -176,7 +256,57 @@ impl World {
                 }
             }
         }
-        World { chunks }
+        let mut world = World { chunks };
+        world.place_trees();
+        world
+    }
+
+    fn place_trees(&mut self) {
+        for wx in 0..WORLD_BLOCKS {
+            for wz in 0..WORLD_BLOCKS {
+                if !has_tree(wx, wz) { continue; }
+                let ground = terrain_height(wx, wz);
+                if ground < SEA_LEVEL || ground >= WORLD_BLOCKS - 7 { continue; }
+
+                let trunk_height = 4 + ((hash2d(wx * 3, wz * 3) * 2.0) as i32); // 4-5
+
+                // Trunk
+                for dy in 1..=trunk_height {
+                    self.set_block_if_air(wx, ground + dy, wz, BLOCK_WOOD);
+                }
+
+                // Leaf canopy — 3 layers
+                let top = ground + trunk_height;
+                for dy in -1..=1_i32 {
+                    let radius: i32 = if dy == 1 { 1 } else { 2 };
+                    for dx in -radius..=radius {
+                        for dz in -radius..=radius {
+                            // Skip corners for rounder shape
+                            if dx.abs() == radius && dz.abs() == radius { continue; }
+                            let lx = wx + dx;
+                            let ly = top + dy;
+                            let lz = wz + dz;
+                            self.set_block_if_air(lx, ly, lz, BLOCK_LEAVES);
+                        }
+                    }
+                }
+                // Top cap
+                self.set_block_if_air(wx, top + 2, wz, BLOCK_LEAVES);
+            }
+        }
+    }
+
+    fn set_block_if_air(&mut self, wx: i32, wy: i32, wz: i32, block: u8) {
+        if !Self::in_bounds(wx, wy, wz) { return; }
+        let cx = wx.div_euclid(CHUNK_SIZE);
+        let cy = wy.div_euclid(CHUNK_SIZE);
+        let cz = wz.div_euclid(CHUNK_SIZE);
+        let lx = wx.rem_euclid(CHUNK_SIZE) as usize;
+        let ly = wy.rem_euclid(CHUNK_SIZE) as usize;
+        let lz = wz.rem_euclid(CHUNK_SIZE) as usize;
+        if let Some(idx) = Self::chunk_index(cx, cy, cz) {
+            self.chunks[idx].set_block_if_air(lx, ly, lz, block);
+        }
     }
 
     fn chunk_index(cx: i32, cy: i32, cz: i32) -> Option<usize> {
@@ -289,7 +419,7 @@ impl ChunkMesh {
                         let bx = wx as f32;
                         let by = wy as f32;
                         let bz = wz as f32;
-                        let col = block_face_color(block_id, face);
+                        let col = block_face_color_noisy(block_id, face, wx, wy, wz);
 
                         for v in &FACE_VERTS[face] {
                             positions.push(bx + v[0]);
@@ -535,7 +665,7 @@ impl Player {
         self.pitch = self.pitch.clamp(-1.5, 1.5);
 
         let forward = Vec3::new(self.yaw.sin(), 0.0, self.yaw.cos());
-        let right = Vec3::new(self.yaw.cos(), 0.0, -self.yaw.sin());
+        let right = Vec3::new(-self.yaw.cos(), 0.0, self.yaw.sin());
 
         let mut dir = Vec3::ZERO;
         if rl.is_key_down(KeyboardKey::KEY_W) { dir += forward; }
@@ -639,8 +769,8 @@ fn main() {
     let mut dirty: Vec<bool> = vec![false; num_chunks];
 
     // Block types the player can place (cycle with 1-4 keys)
-    const PLACEABLE: [u8; 4] = [BLOCK_GRASS, BLOCK_DIRT, BLOCK_STONE, BLOCK_WOOD];
-    const PLACE_NAMES: [&str; 4] = ["Grass", "Dirt", "Stone", "Wood"];
+    const PLACEABLE: [u8; 5] = [BLOCK_GRASS, BLOCK_DIRT, BLOCK_STONE, BLOCK_WOOD, BLOCK_LEAVES];
+    const PLACE_NAMES: [&str; 5] = ["Grass", "Dirt", "Stone", "Wood", "Leaves"];
     let mut selected: usize = 0;
 
     while !rl.window_should_close() {
@@ -652,6 +782,7 @@ fn main() {
         if rl.is_key_pressed(KeyboardKey::KEY_TWO)   { selected = 1; }
         if rl.is_key_pressed(KeyboardKey::KEY_THREE) { selected = 2; }
         if rl.is_key_pressed(KeyboardKey::KEY_FOUR)  { selected = 3; }
+        if rl.is_key_pressed(KeyboardKey::KEY_FIVE)  { selected = 4; }
 
         // Scroll wheel to cycle
         let scroll = rl.get_mouse_wheel_move();
@@ -735,7 +866,7 @@ fn main() {
 
         d.draw_fps(10, 10);
         let block_name = PLACE_NAMES[selected];
-        let hud = format!("[{}] {} | LMB: break | RMB: place | 1-4/Scroll: select | WASD SPACE", selected + 1, block_name);
+        let hud = format!("[{}] {} | LMB: break | RMB: place | 1-5/Scroll: select | WASD SPACE", selected + 1, block_name);
         d.draw_text(&hud, 10, 30, 18, Color::WHITE);
     }
 }
