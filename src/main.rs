@@ -15,6 +15,7 @@ const GRAVITY: f32 = 20.0;
 const JUMP_SPEED: f32 = 8.0;
 const MOVE_SPEED: f32 = 5.0;
 const MOUSE_SENSITIVITY: f32 = 0.003;
+const REACH_DISTANCE: f32 = 6.0;
 
 // 6 vertices per face (2 triangles), offsets from block origin
 const FACE_VERTS: [[[f32; 3]; 6]; 6] = [
@@ -88,6 +89,10 @@ impl Chunk {
         self.blocks[Self::index(x, y, z)]
     }
 
+    fn set_block(&mut self, x: usize, y: usize, z: usize, block: u8) {
+        self.blocks[Self::index(x, y, z)] = block;
+    }
+
     /// Returns AIR for out-of-bounds, so chunk-edge faces are always drawn.
     fn get_block_safe(&self, x: i32, y: i32, z: i32) -> u8 {
         if x < 0 || x >= CHUNK_SIZE as i32 || y < 0 || y >= CHUNK_SIZE as i32 || z < 0 || z >= CHUNK_SIZE as i32 {
@@ -95,6 +100,10 @@ impl Chunk {
         } else {
             self.get_block(x as usize, y as usize, z as usize)
         }
+    }
+
+    fn in_bounds(x: i32, y: i32, z: i32) -> bool {
+        x >= 0 && x < CHUNK_SIZE as i32 && y >= 0 && y < CHUNK_SIZE as i32 && z >= 0 && z < CHUNK_SIZE as i32
     }
 }
 
@@ -105,6 +114,7 @@ impl Chunk {
 struct ChunkMesh {
     mesh: ffi::Mesh,
     material: ffi::Material,
+    has_data: bool,
 }
 
 impl ChunkMesh {
@@ -132,7 +142,7 @@ impl ChunkMesh {
                         let nz = z as i32 + n[2];
 
                         if chunk.get_block_safe(nx, ny, nz) != BLOCK_AIR {
-                            continue; // neighbor is solid — skip this face
+                            continue;
                         }
 
                         let norm = &FACE_NORMALS[face];
@@ -164,7 +174,8 @@ impl ChunkMesh {
         mesh.vertexCount = vertex_count;
         mesh.triangleCount = triangle_count;
 
-        if vertex_count > 0 {
+        let has_data = vertex_count > 0;
+        if has_data {
             mesh.vertices = positions.as_mut_ptr();
             mesh.normals = normals.as_mut_ptr();
             mesh.colors = colors.as_mut_ptr();
@@ -179,11 +190,11 @@ impl ChunkMesh {
 
         let material = unsafe { ffi::LoadMaterialDefault() };
 
-        ChunkMesh { mesh, material }
+        ChunkMesh { mesh, material, has_data }
     }
 
     fn draw(&self) {
-        if self.mesh.vertexCount == 0 {
+        if !self.has_data {
             return;
         }
         let transform = ffi::Matrix {
@@ -196,6 +207,107 @@ impl ChunkMesh {
             ffi::DrawMesh(self.mesh, self.material, transform);
         }
     }
+
+    fn unload(&mut self) {
+        if self.has_data {
+            unsafe { ffi::UnloadMesh(self.mesh); }
+            self.has_data = false;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DDA Voxel Raycast
+// ---------------------------------------------------------------------------
+
+/// Result of a voxel raycast.
+struct RayHit {
+    /// Block coordinate that was hit.
+    block: IVec3,
+    /// The block coordinate adjacent to the hit face (for placement).
+    adjacent: IVec3,
+}
+
+/// Cast a ray through the voxel grid using DDA. Returns the first solid block hit.
+fn raycast_voxel(chunk: &Chunk, origin: Vec3, direction: Vec3, max_dist: f32) -> Option<RayHit> {
+    let dir = direction.normalize();
+
+    // Current voxel position
+    let mut voxel = IVec3::new(
+        origin.x.floor() as i32,
+        origin.y.floor() as i32,
+        origin.z.floor() as i32,
+    );
+
+    // Step direction (+1 or -1) for each axis
+    let step = IVec3::new(
+        if dir.x >= 0.0 { 1 } else { -1 },
+        if dir.y >= 0.0 { 1 } else { -1 },
+        if dir.z >= 0.0 { 1 } else { -1 },
+    );
+
+    // Distance along ray to cross one full voxel on each axis
+    let t_delta = Vec3::new(
+        if dir.x != 0.0 { (1.0 / dir.x).abs() } else { f32::MAX },
+        if dir.y != 0.0 { (1.0 / dir.y).abs() } else { f32::MAX },
+        if dir.z != 0.0 { (1.0 / dir.z).abs() } else { f32::MAX },
+    );
+
+    // Distance along ray to the next voxel boundary on each axis
+    let mut t_max = Vec3::new(
+        if dir.x > 0.0 {
+            ((voxel.x as f32 + 1.0) - origin.x) / dir.x
+        } else if dir.x < 0.0 {
+            (voxel.x as f32 - origin.x) / dir.x
+        } else {
+            f32::MAX
+        },
+        if dir.y > 0.0 {
+            ((voxel.y as f32 + 1.0) - origin.y) / dir.y
+        } else if dir.y < 0.0 {
+            (voxel.y as f32 - origin.y) / dir.y
+        } else {
+            f32::MAX
+        },
+        if dir.z > 0.0 {
+            ((voxel.z as f32 + 1.0) - origin.z) / dir.z
+        } else if dir.z < 0.0 {
+            (voxel.z as f32 - origin.z) / dir.z
+        } else {
+            f32::MAX
+        },
+    );
+
+    let mut prev = voxel;
+
+    for _ in 0..((max_dist * 2.0) as usize + 1) {
+        // Check if current voxel is solid
+        if chunk.get_block_safe(voxel.x, voxel.y, voxel.z) != BLOCK_AIR {
+            return Some(RayHit {
+                block: voxel,
+                adjacent: prev,
+            });
+        }
+
+        prev = voxel;
+
+        // Advance to the next voxel boundary on the closest axis
+        if t_max.x < t_max.y && t_max.x < t_max.z {
+            if t_max.x > max_dist { break; }
+            voxel.x += step.x;
+            t_max.x += t_delta.x;
+        } else if t_max.y < t_max.z {
+            if t_max.y > max_dist { break; }
+            voxel.y += step.y;
+            t_max.y += t_delta.y;
+        } else {
+            if t_max.z > max_dist { break; }
+            voxel.z += step.z;
+            t_max.z += t_delta.z;
+        }
+    }
+
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -249,6 +361,18 @@ impl Player {
         }
     }
 
+    fn eye_position(&self) -> Vec3 {
+        self.position + Vec3::new(0.0, EYE_HEIGHT, 0.0)
+    }
+
+    fn look_direction(&self) -> Vec3 {
+        Vec3::new(
+            self.yaw.sin() * self.pitch.cos(),
+            self.pitch.sin(),
+            self.yaw.cos() * self.pitch.cos(),
+        )
+    }
+
     fn update(&mut self, rl: &RaylibHandle, chunk: &Chunk, dt: f32) {
         // Mouse look
         let md = rl.get_mouse_delta();
@@ -299,7 +423,6 @@ impl Player {
 
         if aabb_collides(chunk, min, max) {
             if self.velocity.y <= 0.0 {
-                // Falling — find highest solid block top in the AABB
                 let by_min = min.y.floor() as i32;
                 let by_max = (max.y - 0.001).floor() as i32;
                 let bx_min = min.x.floor() as i32;
@@ -320,7 +443,6 @@ impl Player {
                 self.position.y = highest_top;
                 self.on_ground = true;
             } else {
-                // Rising — find lowest solid block bottom in the AABB
                 let by_min = min.y.floor() as i32;
                 let by_max = (max.y - 0.001).floor() as i32;
                 let bx_min = min.x.floor() as i32;
@@ -348,7 +470,6 @@ impl Player {
     }
 
     fn resolve_xz(&mut self, chunk: &Chunk, dt: f32) {
-        // X axis
         let new_x = self.position.x + self.velocity.x * dt;
         let min = Vec3::new(new_x - PLAYER_HALF_WIDTH, self.position.y, self.position.z - PLAYER_HALF_WIDTH);
         let max = Vec3::new(new_x + PLAYER_HALF_WIDTH, self.position.y + PLAYER_HEIGHT, self.position.z + PLAYER_HALF_WIDTH);
@@ -356,7 +477,6 @@ impl Player {
             self.position.x = new_x;
         }
 
-        // Z axis
         let new_z = self.position.z + self.velocity.z * dt;
         let min = Vec3::new(self.position.x - PLAYER_HALF_WIDTH, self.position.y, new_z - PLAYER_HALF_WIDTH);
         let max = Vec3::new(self.position.x + PLAYER_HALF_WIDTH, self.position.y + PLAYER_HEIGHT, new_z + PLAYER_HALF_WIDTH);
@@ -366,13 +486,8 @@ impl Player {
     }
 
     fn camera(&self) -> Camera3D {
-        let eye = self.position + Vec3::new(0.0, EYE_HEIGHT, 0.0);
-        let look_dir = Vec3::new(
-            self.yaw.sin() * self.pitch.cos(),
-            self.pitch.sin(),
-            self.yaw.cos() * self.pitch.cos(),
-        );
-        let target = eye + look_dir;
+        let eye = self.eye_position();
+        let target = eye + self.look_direction();
 
         Camera3D::perspective(
             Vector3::new(eye.x, eye.y, eye.z),
@@ -396,26 +511,86 @@ fn main() {
     rl.set_target_fps(60);
     rl.disable_cursor();
 
-    let chunk = Chunk::new(IVec3::ZERO);
-    let chunk_mesh = ChunkMesh::build(&chunk);
+    let mut chunk = Chunk::new(IVec3::ZERO);
+    let mut chunk_mesh = ChunkMesh::build(&chunk);
+    let mut mesh_dirty = false;
 
-    // Spawn player above the grass floor
     let mut player = Player::new(Vec3::new(8.0, 1.0, 8.0));
 
     while !rl.window_should_close() {
         let dt = rl.get_frame_time();
         player.update(&rl, &chunk, dt);
 
+        // Raycast from eye
+        let eye = player.eye_position();
+        let dir = player.look_direction();
+        let hit = raycast_voxel(&chunk, eye, dir, REACH_DISTANCE);
+
+        // Block interaction
+        if rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) {
+            if let Some(ref h) = hit {
+                let b = h.block;
+                if Chunk::in_bounds(b.x, b.y, b.z) {
+                    chunk.set_block(b.x as usize, b.y as usize, b.z as usize, BLOCK_AIR);
+                    mesh_dirty = true;
+                }
+            }
+        }
+
+        if rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_RIGHT) {
+            if let Some(ref h) = hit {
+                let a = h.adjacent;
+                if Chunk::in_bounds(a.x, a.y, a.z)
+                    && chunk.get_block_safe(a.x, a.y, a.z) == BLOCK_AIR
+                {
+                    // Don't place if it would overlap the player
+                    let pmin = player.position - Vec3::new(PLAYER_HALF_WIDTH, 0.0, PLAYER_HALF_WIDTH);
+                    let pmax = player.position + Vec3::new(PLAYER_HALF_WIDTH, PLAYER_HEIGHT, PLAYER_HALF_WIDTH);
+                    let bmin = Vec3::new(a.x as f32, a.y as f32, a.z as f32);
+                    let bmax = bmin + Vec3::ONE;
+
+                    let overlaps = pmin.x < bmax.x && pmax.x > bmin.x
+                        && pmin.y < bmax.y && pmax.y > bmin.y
+                        && pmin.z < bmax.z && pmax.z > bmin.z;
+
+                    if !overlaps {
+                        chunk.set_block(a.x as usize, a.y as usize, a.z as usize, BLOCK_GRASS);
+                        mesh_dirty = true;
+                    }
+                }
+            }
+        }
+
+        // Rebuild mesh if blocks changed
+        if mesh_dirty {
+            chunk_mesh.unload();
+            chunk_mesh = ChunkMesh::build(&chunk);
+            mesh_dirty = false;
+        }
+
         let camera = player.camera();
         let mut d = rl.begin_drawing(&thread);
         d.clear_background(Color::new(135, 206, 235, 255));
 
         {
-            let _d3 = d.begin_mode3D(camera);
+            let mut d3 = d.begin_mode3D(camera);
             chunk_mesh.draw();
+
+            // Draw highlight wireframe on targeted block
+            if let Some(ref h) = hit {
+                let b = h.block;
+                let center = Vector3::new(b.x as f32 + 0.5, b.y as f32 + 0.5, b.z as f32 + 0.5);
+                d3.draw_cube_wires(center, 1.01, 1.01, 1.01, Color::WHITE);
+            }
         }
 
+        // Crosshair
+        let cx = 1280 / 2;
+        let cy = 720 / 2;
+        d.draw_line(cx - 10, cy, cx + 10, cy, Color::WHITE);
+        d.draw_line(cx, cy - 10, cx, cy + 10, Color::WHITE);
+
         d.draw_fps(10, 10);
-        d.draw_text("WASD + Mouse | SPACE to jump", 10, 30, 18, Color::WHITE);
+        d.draw_text("LMB: break | RMB: place | WASD + Mouse | SPACE: jump", 10, 30, 18, Color::WHITE);
     }
 }
